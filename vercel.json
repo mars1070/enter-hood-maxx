@@ -1,0 +1,7 @@
+{
+  "functions": {
+    "api/hoodmaxx.js": {
+      "maxDuration": 60
+    }
+  }
+}
