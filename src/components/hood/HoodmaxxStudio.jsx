@@ -8,31 +8,65 @@ const PLACEMENTS = [
   { id: "slash", label: "SLASH" },
 ];
 
-function fileToPayload(file) {
-  return new Promise((resolve, reject) => {
-    const img = new Image();
-    const url = URL.createObjectURL(file);
-    img.onload = () => {
-      const max = 1280;
-      const scale = Math.min(1, max / Math.max(img.width, img.height));
-      const w = Math.round(img.width * scale);
-      const h = Math.round(img.height * scale);
-      const canvas = document.createElement("canvas");
-      canvas.width = w;
-      canvas.height = h;
-      const ctx = canvas.getContext("2d");
-      ctx.drawImage(img, 0, 0, w, h);
-      URL.revokeObjectURL(url);
-      const dataUrl = canvas.toDataURL("image/jpeg", 0.88);
-      const image = dataUrl.split(",")[1];
-      resolve({ preview: dataUrl, image, mimeType: "image/jpeg" });
-    };
-    img.onerror = () => {
-      URL.revokeObjectURL(url);
-      reject(new Error("unreadable image"));
-    };
-    img.src = url;
-  });
+const MAX_EDGE = 1280;
+const REQUEST_TIMEOUT_MS = 75000;
+
+async function decodeImage(file) {
+  // createImageBitmap honours EXIF orientation, so phone photos stay upright.
+  if (typeof createImageBitmap === "function") {
+    try {
+      return await createImageBitmap(file, { imageOrientation: "from-image" });
+    } catch {
+      /* Safari < 17 and HEIC fall through to the <img> path below. */
+    }
+  }
+  const url = URL.createObjectURL(file);
+  try {
+    return await new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = () => reject(new Error("unreadable image"));
+      img.src = url;
+    });
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+async function fileToPayload(file) {
+  const bitmap = await decodeImage(file);
+  const sw = bitmap.width;
+  const sh = bitmap.height;
+  if (!sw || !sh) throw new Error("unreadable image");
+
+  const scale = Math.min(1, MAX_EDGE / Math.max(sw, sh));
+  const w = Math.max(1, Math.round(sw * scale));
+  const h = Math.max(1, Math.round(sh * scale));
+
+  const canvas = document.createElement("canvas");
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext("2d");
+  // JPEG has no alpha: paint white first so transparent PNGs don't go black.
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(0, 0, w, h);
+  ctx.drawImage(bitmap, 0, 0, w, h);
+  bitmap.close?.();
+
+  const dataUrl = canvas.toDataURL("image/jpeg", 0.88);
+  const image = dataUrl.split(",")[1];
+  if (!image) throw new Error("could not read that photo");
+  return { preview: dataUrl, image, mimeType: "image/jpeg" };
+}
+
+/** Vercel returns HTML on gateway errors, so never trust the body to be JSON. */
+async function readJson(res) {
+  const text = await res.text();
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { error: res.ok ? "bad response from the tape machine" : `server error ${res.status}` };
+  }
 }
 
 export default function HoodmaxxStudio() {
@@ -49,19 +83,31 @@ export default function HoodmaxxStudio() {
       setError("DROP A PHOTO, NOT A PDF.");
       return;
     }
+    if (file.size > 25 * 1024 * 1024) {
+      setError("PHOTO TOO HEAVY. UNDER 25 MB.");
+      return;
+    }
     setError("");
     setResult(null);
-    const payload = await fileToPayload(file);
-    setSource(payload);
+    try {
+      setSource(await fileToPayload(file));
+    } catch (err) {
+      setSource(null);
+      const heic = /\.hei[cf]$/i.test(file.name) || /hei[cf]/i.test(file.type);
+      setError(heic ? "HEIC NOT SUPPORTED. EXPORT AS JPG OR PNG." : String(err.message || err).toUpperCase());
+    }
   }, []);
 
   const generate = async () => {
     if (!source || busy) return;
     setBusy(true);
     setError("");
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
     try {
       const res = await fetch("/api/hoodmaxx", {
         method: "POST",
+        signal: controller.signal,
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           image: source.image,
@@ -69,12 +115,15 @@ export default function HoodmaxxStudio() {
           placement,
         }),
       });
-      const data = await res.json();
+      const data = await readJson(res);
       if (!res.ok) throw new Error(data.error || "tape jammed");
-      setResult(`data:${data.mimeType};base64,${data.image}`);
+      if (!data.image) throw new Error("no image came back — hit maxx again");
+      setResult(`data:${data.mimeType || "image/png"};base64,${data.image}`);
     } catch (err) {
-      setError(String(err.message || err).toUpperCase());
+      const msg = err.name === "AbortError" ? "took too long — hit maxx again" : err.message || err;
+      setError(String(msg).toUpperCase());
     } finally {
+      clearTimeout(timer);
       setBusy(false);
     }
   };
